@@ -4,20 +4,43 @@ build-backend = "hatchling.build"
 
 [project]
 name = "contextgc"
-version = "0.0.1"
+version = "0.1.0"
 description = "Dependency-aware context runtime for LLM agents: semantic garbage collection, dependency tracking and causal attribution for context pruning."
 readme = "README.md"
 license = { text = "MIT" }
 authors = [{ name = "Sathi Vamsi Krishna Reddy" }]
 requires-python = ">=3.10"
+keywords = ["llm", "agents", "context-window", "rag", "garbage-collection", "attribution"]
+classifiers = [
+  "Development Status :: 3 - Alpha",
+  "Intended Audience :: Developers",
+  "License :: OSI Approved :: MIT License",
+  "Programming Language :: Python :: 3",
+  "Topic :: Scientific/Engineering :: Artificial Intelligence",
+]
 dependencies = []
 
 [project.optional-dependencies]
+hf = ["torch>=2.1", "transformers>=4.40"]
 dev = ["pytest>=8", "ruff>=0.5"]
+
+[project.scripts]
+contextgc = "contextgc.cli:main"
+
+[project.urls]
+Homepage = "https://github.com/vamsireddy0807/contextgc"
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/contextgc"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
-pythonpath = ["src"]
+pythonpath = ["src", "benchmarks"]
+
+[tool.ruff]
+line-length = 120
+target-version = "py310"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "B", "UP"]
+ignore = ["UP006", "UP007", "UP035", "UP045"]

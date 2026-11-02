@@ -1,127 +1,144 @@
 # ContextGC
 
+[![ci](https://github.com/vamsireddy0807/contextgc/actions/workflows/ci.yml/badge.svg)](https://github.com/vamsireddy0807/contextgc/actions/workflows/ci.yml)
+![python](https://img.shields.io/badge/python-3.10%E2%80%933.13-blue)
+![license](https://img.shields.io/badge/license-MIT-green)
+
 **Dependency-aware context runtime for LLM agents: semantic garbage collection, dependency tracking and causal attribution for context pruning.**
 
-> Status: in development (v0.1). Every number in this README is a target or a plan, not a result. Results go in `benchmarks/RESULTS.md` only after they are measured.
-
----
-
-## Why
-
-Long-running agents pile up context: system prompts, user turns, tool outputs, retrieved chunks, scratch notes. When the window fills, today's options are blunt:
+Long-running agents pile up system prompts, user turns, tool calls, tool results and retrieved chunks until the context window overflows. The usual fixes are blunt:
 
 | Approach | What goes wrong |
 |---|---|
-| Drop the oldest messages | Deletes the one tool result step 14 still needs |
-| Summarise old turns | Lossy, unverifiable, and silently changes facts |
-| Token-level compression | Saves tokens but has no idea which blocks later steps depend on |
+| Drop the oldest messages | Deletes the tool result that step 14 still needs |
+| Summarise old turns | Lossy, unverifiable, silently changes facts |
+| Token-level compression | Saves tokens with no idea which blocks later steps depend on |
 
-None of them know **what depends on what**, and none of them can explain **why** a block was removed. Pruning becomes a guess, and failures are silent.
-
-## Core idea: treat context like a heap
-
-1. **Nodes.** Every context block is a node: `id`, `kind` (system, user, assistant, tool_result, retrieved_chunk, note), `tokens`, `content_hash`, `created_at`.
-2. **Edges ("uses").** When a step consumes a block, record an edge `step -> block`.
-   - *Explicit*: a tool call references a result id; an answer cites a chunk id.
-   - *Inferred*: lexical or semantic overlap between a step's output and a block (lower confidence, marked as inferred).
-3. **Roots.** System prompt, pinned facts, the current task, open tool calls. Roots are never collected.
-4. **Mark and sweep.** Mark everything reachable from roots and live steps; unreachable blocks move to cold storage.
-5. **Causal attribution before pruning reachable blocks.** If the budget still isn't met, score reachable, unpinned blocks by ablation: remove the block, re-score the current answer (log-probability or answer similarity), and measure the change. Only blocks whose attribution falls below a threshold are pruned.
-6. **Audit trail.** Every prune records *what*, *why* (unreachable or low attribution plus score), *when* and *policy version*. Every prune is reversible from cold storage.
+ContextGC treats context like a heap. It tracks **what depends on what**, keeps everything that a live step depends on, removes what nothing needs, and when it has to choose, it **measures** each block's contribution by ablation before pruning it. Every removal is audited and reversible, and protected context is never silently truncated.
 
 ```
- messages / tool results / retrieved chunks
-                 |
-                 v
-        +-----------------+      uses-edges       +-----------+
-        |  ContextGraph   | <-------------------- |  Steps    |
-        +-----------------+                       +-----------+
-                 |
-        mark from roots + live steps
-                 |
-     +-----------+------------+
-     | unreachable            | reachable, over budget
-     v                        v
-  sweep to cold store    ablation attribution -> prune if score < threshold
-                 \             /
-                  v           v
-             audit log (reason, score, policy version)
-                 |
-                 v
-          render() -> prompt within budget
+pip install "git+https://github.com/vamsireddy0807/contextgc"          # core: zero dependencies
+pip install "contextgc[hf] @ git+https://github.com/vamsireddy0807/contextgc"   # + local model scorer
 ```
+
+## Quickstart
+
+```python
+from contextgc import ContextGraph, LexicalSupportScorer, Policy
+
+g = ContextGraph(budget_tokens=150)
+g.add_message("system", "You are a careful research agent.")          # system messages are pinned
+call = g.add_tool_call("search", {"q": "aurora"})
+res = g.add_tool_result(call, "Project Aurora launches 14 March; launch code K7-29.")
+other = g.add_tool_result(g.add_tool_call("search", {"q": "cobalt"}), "Cobalt budget is 4M.")
+
+g.link("draft_section_1", [res])        # explicit dependency: protected while the step is live
+g.add_message("user", "Now add the Aurora risks.")
+
+report = g.collect(
+    Policy(keep_recent=2, infer_edges=True, attribution="ablation"),
+    scorer=LexicalSupportScorer(),
+)
+print(report.summary())                 # tokens before/after, swept, pruned, policy version
+messages = g.render("openai")           # or "anthropic" / "text"; tool call/result pairs stay intact
+g.restore(other)                        # anything removed can be brought back
+```
+
+`python examples/research_agent.py` runs a fuller session: 227 tokens collected to 129 under a 150-token budget, with the explicitly cited Aurora facts protected and the unrelated searches swept.
+
+## How it works
+
+**Blocks** are units of context: `system`, `user`, `assistant`, `tool_call`, `tool_result`, `retrieved`, `note`. A tool call and its result share a **removal unit**, so they are always kept or removed together (model APIs reject orphaned tool results).
+
+**Steps** are anything that consumes context, such as a model call or an answer being drafted. `g.link(step, uses=[...])` records **explicit** edges; `infer_edges=True` adds **inferred** edges from the current query by TF-IDF cosine similarity. An explicit edge is never downgraded to an inferred one.
+
+`collect()` runs three phases:
+
+1. **Mark.** Roots are pinned blocks, the newest `keep_recent` blocks, and every block a live step uses through an explicit edge. Their closure over `depends_on` and removal units is **hard-reachable** and is never removed. Blocks reached only through inferred edges are **soft-reachable**.
+2. **Sweep.** Unreachable units move to the cold store, oldest first (`sweep="lazy"` stops as soon as the budget is met; `"eager"` sweeps them all).
+3. **Prune.** If still over budget, soft-reachable units are pruned:
+   * `attribution="ablation"`: each unit is scored by leave-one-unit-out ablation, `u(context) - u(context without unit)`. Units are pruned lowest first and only below `min_attribution`, and the **marginal** score is re-checked against the current context before each prune, so two redundant copies of the same evidence are never both pruned on stale scores.
+   * `attribution="none"`: pruned by lowest inferred confidence, oldest first.
 
 ## Explicit failure boundaries
 
-- Pinned and root blocks are **never** pruned.
-- If attribution cannot be computed (API error, timeout), the block is **kept** (fail closed).
-- If the budget cannot be met without dropping a high-attribution reachable block, `collect()` raises `BudgetExceeded`; it never silently truncates.
-- Inferred edges never override explicit ones.
+* Pinned blocks, recent blocks and explicit dependencies of live steps are never removed.
+* If the budget cannot be met without breaking that rule, `collect()` raises `BudgetExceeded` (with the partial report attached) instead of truncating. Use `on_over_budget="warn"` to get a report with `budget_met=False` instead.
+* If a scorer fails, times out or returns NaN, the affected units are **kept** and an audit entry records why (fail closed). Units beyond `max_attribution_units` are kept, not guessed.
+* Adding a block that depends on removed context restores that context first; restoring a block restores its whole unit and its dependencies.
+* Every sweep, prune, restore and error-driven keep is written to an append-only audit log stamped with the policy's version hash, optionally mirrored to JSONL as it happens.
 
-## API sketch (planned)
+## Scorers
 
-```python
-from contextgc import ContextGraph, Policy
+| Scorer | What it measures | Needs |
+|---|---|---|
+| `LexicalSupportScorer` | IDF-weighted share of the target's terms present in the context; deterministic | nothing |
+| `TransformersLogProbScorer` | Mean log-probability of the target under a local causal LM given the context | `contextgc[hf]` |
+| `CallableScorer(fn)` | Anything you wrap, such as a hosted model's log-probs or a judge | your function |
 
-g = ContextGraph(budget_tokens=16_000)
+The attribution target defaults to the latest user message; pass `target=` (for example a drafted answer) to attribute against that instead.
 
-sys_id = g.add("You are a careful research agent.", kind="system", pinned=True)
-r1 = g.add(search_results, kind="tool_result", produced_by="search#1")
-r2 = g.add(old_scratchpad, kind="note")
+## Rendering
 
-g.link(step="answer#7", uses=[r1])           # explicit dependency
+* `render("openai")`: chat messages; consecutive tool calls are merged into one assistant message and results become `role: tool` messages.
+* `render("anthropic")`: `{"system", "messages"}` with `tool_use` and `tool_result` blocks, merged same-role turns, and tool results placed first in a user turn.
+* `render("text")`: a transcript with inline tombstones, for logs.
 
-report = g.collect(policy=Policy(
-    attribution="ablation",                  # or "none" for pure mark-and-sweep
-    min_attribution=0.05,
-    scorer="logprob",                        # pluggable: logprob | embedding_similarity
-))
+In the API styles, removed context is summarised in a single system note listing the restorable ids. Notes are never placed inline, so they cannot split a tool call from its result.
 
-prompt = g.render()                          # within budget, order preserved
-for entry in g.audit_log():
-    print(entry.block_id, entry.reason, entry.score)
+## CLI
+
+```
+contextgc prune chat.json --budget 2000 --keep-recent 4 --infer-edges \
+    --attribution ablation --scorer lexical --style openai --out pruned.json --audit audit.jsonl
+```
+
+Input is a saved trace (`ContextGraph.save`) or a plain list of `{"role", "content"}` messages. The command exits with code 2 when the budget cannot be met without removing protected context.
+
+## Benchmark (synthetic)
+
+`python benchmarks/needle_retention.py --sessions 200 --out benchmarks/RESULTS.md` builds sessions of 24 look-alike search results in which 2 are needed for the final question, then fits each session into a budget.
+
+| Budget | Strategy | Needed results kept | Tokens removed |
+|---|---|---|---|
+| 25% of session | truncate oldest (baseline) | 0.5% | 78.6% |
+| 25% of session | ContextGC: inferred edges | 100.0% | 78.6% |
+| 40% of session | truncate oldest (baseline) | 12.0% | 62.1% |
+| 40% of session | ContextGC: inferred edges | 100.0% | 62.1% |
+
+Full table in [`benchmarks/RESULTS.md`](benchmarks/RESULTS.md). **This is a synthetic sanity check.** The question names the needed projects, so similarity-based inference is favoured by construction. It shows the pipeline behaves as designed and catches regressions; it is not evidence of accuracy on real agent traffic. A benchmark on recorded agent traces is on the roadmap.
+
+## Project layout
+
+```
+src/contextgc/
+  graph.py         blocks, units, steps, edges, restore, save/load
+  gc.py            mark, sweep, prune; CollectReport
+  attribution.py   ablation attribution and scorers
+  infer.py         TF-IDF edge inference from the query
+  policy.py        versioned policies
+  render.py        openai / anthropic / text rendering with tombstones
+  audit.py         append-only audit log (JSONL)
+  store.py         cold store
+  cli.py           `contextgc prune`
+tests/             pytest suite (50 tests)
+benchmarks/        synthetic needle-retention benchmark
+examples/          end-to-end research-agent session
 ```
 
 ## Roadmap
 
-- **v0.1:** graph model, explicit edges, mark and sweep, token budget, cold store, audit log, unit tests.
-- **v0.2:** ablation attribution with a small open model (log-probabilities) plus a pluggable API scorer; batching to keep attribution cost bounded.
-- **v0.3:** benchmark harness comparing truncation, summarisation, LLMLingua and ContextGC on long multi-hop QA and recorded agent traces.
-- **v0.4:** adapters for OpenAI-compatible and Anthropic message lists; OpenTelemetry spans for every prune.
+* **v0.2:** batched ablation for model scorers; group-testing to cut scorer calls on large candidate sets.
+* **v0.3:** benchmark on recorded agent traces (multi-hop QA and tool-heavy tasks) against truncation, summarisation and LLMLingua, measuring answer accuracy at fixed budgets.
+* **v0.4:** adapters for agent frameworks; OpenTelemetry spans for every collection.
 
-## Evaluation plan (what to measure before claiming anything)
+## Related work
 
-| Metric | Definition |
-|---|---|
-| Token reduction | % tokens removed at equal answer accuracy |
-| Accuracy drop | percentage-point change at a fixed token budget |
-| Attribution cost | extra model calls and latency per `collect()` |
-| Safety | number of times a block later needed was pruned (should be 0 with explicit edges) |
-
-Rule: only numbers in `benchmarks/RESULTS.md`, produced by a script in `benchmarks/`, go on a resume.
-
-## Repository layout (planned)
-
-```
-contextgc/
-  graph.py         # nodes, edges, roots
-  gc.py            # mark and sweep, cold store
-  attribution.py   # ablation scorers
-  policy.py        # thresholds, budgets, versioned policies
-  render.py        # prompt assembly within budget
-  audit.py         # append-only prune log
-tests/
-benchmarks/
-examples/
-```
-
-## Related work to study and build on
-
-- ContextCite (NeurIPS 2024): attributing model generations to context by ablation. https://papers.nips.cc/paper_files/paper/2024/hash/adbea136219b64db96a9941e4249a857-Abstract-Conference.html
-- LLMLingua (Microsoft): prompt compression, a natural baseline. https://github.com/microsoft/LLMLingua
-- MemGPT / Letta: memory management for agents. https://letta.com/blog/memgpt-and-letta
-- OpenTelemetry GenAI semantic conventions for agent spans. https://opentelemetry.io/docs/specs/semconv/gen-ai/gen-ai-agent-spans
+* ContextCite (NeurIPS 2024), attributing model generations to context by ablation: https://papers.nips.cc/paper_files/paper/2024/hash/adbea136219b64db96a9941e4249a857-Abstract-Conference.html
+* LLMLingua (Microsoft), prompt compression: https://github.com/microsoft/LLMLingua
+* MemGPT and Letta, memory management for agents: https://letta.com/blog/memgpt-and-letta
+* OpenTelemetry GenAI semantic conventions for agent spans: https://opentelemetry.io/docs/specs/semconv/gen-ai/gen-ai-agent-spans
 
 ## License
 
-MIT (proposed).
+MIT
